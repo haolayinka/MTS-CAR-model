@@ -1,0 +1,609 @@
+---
+title: "MTS Baseline"
+author: "Hammed"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# data setup
+
+```{r}
+msa_data_level <- read.csv("MSA_data.csv", header = TRUE)
+msa_data <-sqrt(msa_data_level)
+mdata <- data.frame(lapply(msa_data, diff)) # First difference
+MSA_data<-data.frame(lapply(msa_data, function(x) diff(x, differences = 2))) # Second difference
+MSA_data<-as.matrix(MSA_data)
+head(MSA_data)
+```
+
+
+# Baseline MTS Gibbs sampler
+
+```{r}
+# Required libraries
+library(MASS)
+library(coda)
+library(ggplot2)
+library(gridExtra)
+
+# prior values from a pre-sample of y0
+mu_0 = 0.0501835 
+sigma0_sq = 0.003921744
+
+# Helper: sample from discrete grid (generic)
+sample_rho <- function(rho_grid, log_post) {
+  probs <- exp(log_post - max(log_post))
+  probs <- probs / sum(probs)
+  sample(rho_grid, size = 1, prob = probs)
+}
+
+# Gibbs Sampler
+# leave_last_out = TRUE means:
+#   - fit the model on rows 1,...,T-1
+#   - hold out the last row for forecast evaluation
+run_gibbs_full <- function(MSA_data, n_iter = 16000, burn = 1000, thin = 15,
+                           leave_last_out = FALSE) {
+
+  # ------------------------------------------------------------
+  # Leave out the last time point if requested
+  # ------------------------------------------------------------
+  if (leave_last_out) {
+    MSA_fit  <- MSA_data[-nrow(MSA_data), , drop = FALSE]   # training sample: 1,...,T-1
+    MSA_test <- MSA_data[nrow(MSA_data), , drop = FALSE]    # held-out last row: T
+  } else {
+    MSA_fit  <- MSA_data
+    MSA_test <- NULL
+  }
+
+  T <- nrow(MSA_fit)   # this is now T-1 when leave_last_out = TRUE
+  L <- ncol(MSA_fit)
+  keep <- seq(burn + 1, n_iter, by = thin)
+  n_keep <- length(keep)
+
+  # --- Grids ---
+  rho_grid  <- seq(0.05, 0.95, length.out = 100)   # for tau_mu and tau_b
+  rho3_grid <- seq(-0.95, 0.95, length.out = 100) # for correlation rho
+
+  # --- Pull fixed hyperparameters for y0 prior from global env ---
+  mu_0 <- 0.05018355 
+  if (exists("mu_0", envir = .GlobalEnv)) {
+    mu0 <- get("mu_0", envir = .GlobalEnv)
+  } else if (exists("mu0", envir = .GlobalEnv)) {
+    mu0 <- get("mu0", envir = .GlobalEnv)
+  } else {
+    stop("Missing fixed hyperparameter for y0 prior: define mu_0 (or mu0) in the global environment.")
+  }
+
+  sigma0_sq <- 0.003921744
+  if (exists("sigma0_sq", envir = .GlobalEnv)) {
+    sigma0_sq <- get("sigma0_sq", envir = .GlobalEnv)
+  } else if (exists("sigma0_2", envir = .GlobalEnv)) {
+    sigma0_sq <- get("sigma0_2", envir = .GlobalEnv)
+  } else if (exists("sigma_0", envir = .GlobalEnv)) {
+    sigma0_sq <- get("sigma_0", envir = .GlobalEnv)^2
+  } else if (exists("sigma0", envir = .GlobalEnv)) {
+    sigma0_sq <- get("sigma0", envir = .GlobalEnv)^2
+  } else {
+    stop("Missing fixed hyperparameter for y0 prior variance: define sigma0_sq (variance) OR sigma_0/sigma0 (sd) in the global environment.")
+  }
+  if (!is.finite(sigma0_sq) || sigma0_sq <= 0) stop("sigma0_sq must be positive and finite.")
+
+  # --- Initial values ---
+  mu <- b <- numeric(L)
+  for (i in 1:L) {
+    y  <- MSA_fit[-1, i]
+    xl <- MSA_fit[-T, i]
+    fit <- lm.fit(cbind(1, xl), y)
+    mu[i] <- fit$coefficients[1]
+    b[i]  <- fit$coefficients[2]
+  }
+
+  y0 <- rep(0, L)
+  sigma2 <- 0.005
+  theta1 <- mean(mu)
+  theta2 <- mean(b)
+
+  # rho1 and rho2 are tau_mu and tau_b; rho3 is correlation rho
+  rho1 <- 0.5
+  rho2 <- 0.5
+  rho3 <- 0
+
+  # Storage
+  mu_store <- matrix(0, n_keep, L)
+  b_store <- matrix(0, n_keep, L)
+  y0_store <- matrix(0, n_keep, L)
+  sigma2_store <- numeric(n_keep)
+  theta1_store <- numeric(n_keep)
+  theta2_store <- numeric(n_keep)
+  rho1_store <- numeric(n_keep)
+  rho2_store <- numeric(n_keep)
+  rho3_store <- numeric(n_keep)
+
+  k <- 1
+  for (iter in 1:n_iter) {
+
+    tau_mu <- rho1
+    tau_b  <- rho2
+    rho    <- rho3
+
+    sigmu2 <- (1 - tau_mu) / tau_mu
+    sigb2  <- (1 - tau_b)  / tau_b
+    sigmu  <- sqrt(sigmu2)
+    sigb   <- sqrt(sigb2)
+
+    tilde_Sigma <- matrix(
+      c(sigmu2, rho * sigmu * sigb,
+        rho * sigmu * sigb, sigb2),
+      nrow = 2, byrow = TRUE
+    )
+    tilde_Sigma_inv <- solve(tilde_Sigma)
+
+    m0 <- c(theta1, theta2)
+
+    # ---------- (A) Sample y0_i and (mu_i, b_i) in blocks ----------
+    for (i in 1:L) {
+      y <- MSA_fit[, i]
+
+      V0i <- 1 / (1 / sigma0_sq + (b[i]^2) / sigma2)
+      m0i <- V0i * (mu0 / sigma0_sq + b[i] * (y[1] - mu[i]) / sigma2)
+      y0[i] <- rnorm(1, mean = m0i, sd = sqrt(V0i))
+
+      y_lag <- c(y0[i], y[1:(T - 1)])
+      X_i   <- cbind(1, y_lag)
+      y_i   <- y
+
+      XtX <- crossprod(X_i)
+      XtY <- crossprod(X_i, y_i)
+
+      V_i <- solve(tilde_Sigma_inv + (1 / sigma2) * XtX)
+      m_i <- V_i %*% (tilde_Sigma_inv %*% m0 + (1 / sigma2) * XtY)
+
+      beta_i <- MASS::mvrnorm(1, mu = as.numeric(m_i), Sigma = V_i)
+      mu[i] <- beta_i[1]
+      b[i]  <- beta_i[2]
+    }
+
+    # ---------- (B) Blocked update for theta ----------
+    beta_bar <- c(mean(mu), mean(b))
+    theta <- MASS::mvrnorm(1, mu = beta_bar, Sigma = (1 / L) * tilde_Sigma)
+    theta1 <- theta[1]
+    theta2 <- theta[2]
+
+    # ---------- (C) CPD for sigma^2 ----------
+    SSE <- 0
+    for (i in 1:L) {
+      y <- MSA_fit[, i]
+      y_lag <- c(y0[i], y[1:(T - 1)])
+      resid <- y - mu[i] - b[i] * y_lag
+      SSE <- SSE + sum(resid^2)
+    }
+    shape <- (L * T) / 2
+    rate  <- SSE / 2
+    sigma2 <- 1 / rgamma(1, shape = shape, rate = rate)
+
+    # ---------- (D) Grid sampling for tau_mu ----------
+    dmu <- mu - theta1
+    db  <- b  - theta2
+    S11 <- sum(dmu^2)
+    S22 <- sum(db^2)
+    S12 <- sum(dmu * db)
+
+    log_post_rho1 <- sapply(rho_grid, function(tau_candidate) {
+      sigmu2_c <- (1 - tau_candidate) / tau_candidate
+      sigb2_c  <- (1 - rho2) / rho2
+      sigmu_c  <- sqrt(sigmu2_c)
+      sigb_c   <- sqrt(sigb2_c)
+      logdet <- log(sigmu2_c) + log(sigb2_c) + log(1 - rho3^2)
+      quad <- (S11 / sigmu2_c - 2 * rho3 * S12 / (sigmu_c * sigb_c) + S22 / sigb2_c) / (1 - rho3^2)
+      -(L / 2) * logdet - 0.5 * quad
+    })
+    rho1 <- sample_rho(rho_grid, log_post_rho1)
+
+    # ---------- (E) Grid sampling for tau_b ----------
+    log_post_rho2 <- sapply(rho_grid, function(tau_candidate) {
+      sigmu2_c <- (1 - rho1) / rho1
+      sigb2_c  <- (1 - tau_candidate) / tau_candidate
+      sigmu_c  <- sqrt(sigmu2_c)
+      sigb_c   <- sqrt(sigb2_c)
+      logdet <- log(sigmu2_c) + log(sigb2_c) + log(1 - rho3^2)
+      quad <- (S11 / sigmu2_c - 2 * rho3 * S12 / (sigmu_c * sigb_c) + S22 / sigb2_c) / (1 - rho3^2)
+      -(L / 2) * logdet - 0.5 * quad
+    })
+    rho2 <- sample_rho(rho_grid, log_post_rho2)
+
+    # ---------- (F) Grid sampling for rho ----------
+    sigmu2_fix <- (1 - rho1) / rho1
+    sigb2_fix  <- (1 - rho2) / rho2
+    sigmu_fix  <- sqrt(sigmu2_fix)
+    sigb_fix   <- sqrt(sigb2_fix)
+
+    log_post_rho3 <- sapply(rho3_grid, function(rho_candidate) {
+      if (abs(rho_candidate) >= 1) return(-Inf)
+      quad_num <- (S11 / sigmu2_fix - 2 * rho_candidate * S12 / (sigmu_fix * sigb_fix) + S22 / sigb2_fix)
+      -(L / 2) * log(1 - rho_candidate^2) - 0.5 * quad_num / (1 - rho_candidate^2)
+    })
+    rho3 <- sample_rho(rho3_grid, log_post_rho3)
+
+    # ---------- Store ----------
+    if (iter %in% keep) {
+      mu_store[k, ] <- mu
+      b_store[k, ] <- b
+      y0_store[k, ] <- y0
+      sigma2_store[k] <- sigma2
+      theta1_store[k] <- theta1
+      theta2_store[k] <- theta2
+      rho1_store[k] <- rho1
+      rho2_store[k] <- rho2
+      rho3_store[k] <- rho3
+      k <- k + 1
+    }
+  }
+
+  list(
+    mu = mu_store,
+    b = b_store,
+    sigma2 = sigma2_store,
+    theta1 = theta1_store,
+    theta2 = theta2_store,
+    rho1 = rho1_store,
+    rho2 = rho2_store,
+    rho3 = rho3_store,
+    y0 = y0_store,
+    train_data = MSA_fit,
+    test_data = MSA_test
+  )
+}
+
+# ------------------------------------------------------------
+# Posterior predictive forecast for the held-out last row
+# ------------------------------------------------------------
+forecast_last_value <- function(gibbs_result) {
+  if (is.null(gibbs_result$test_data)) {
+    stop("No held-out observation found. Refit using leave_last_out = TRUE.")
+  }
+
+  MSA_fit <- gibbs_result$train_data
+  y_prev  <- MSA_fit[nrow(MSA_fit), ]       # this is y_{T-1}
+  y_true  <- as.numeric(gibbs_result$test_data[1, ])  # true held-out y_T
+
+  n_draws <- length(gibbs_result$sigma2)
+  L <- ncol(MSA_fit)
+
+  pred_draws <- matrix(NA_real_, nrow = n_draws, ncol = L)
+
+  for (s in 1:n_draws) {
+    pred_mean <- gibbs_result$mu[s, ] + gibbs_result$b[s, ] * y_prev
+    pred_draws[s, ] <- rnorm(L, mean = pred_mean, sd = sqrt(gibbs_result$sigma2[s]))
+  }
+
+  if (is.null(colnames(MSA_fit))) {
+    msa_names <- paste0("MSA_", 1:L)
+  } else {
+    msa_names <- colnames(MSA_fit)
+  }
+
+  forecast_summary <- data.frame(
+    MSA = msa_names,
+    actual_last_value = y_true,
+    forecast_mean = colMeans(pred_draws),
+    forecast_median = apply(pred_draws, 2, median),
+    lower_95 = apply(pred_draws, 2, quantile, probs = 0.025),
+    upper_95 = apply(pred_draws, 2, quantile, probs = 0.975)
+  )
+
+  forecast_summary$error <- forecast_summary$actual_last_value - forecast_summary$forecast_mean
+  forecast_summary$abs_error <- abs(forecast_summary$error)
+
+  list(
+    draws = pred_draws,
+    summary = forecast_summary
+  )
+}
+
+# ========================== Run leave-one-out fit ==========================
+result_loo <- run_gibbs_full(MSA_data, leave_last_out = TRUE)
+
+# ========================== Forecast held-out last row =====================
+loo_forecast <- forecast_last_value(result_loo)
+
+# View forecast table
+print(loo_forecast$summary)
+
+# Example overall forecast accuracy
+MAE  <- mean(loo_forecast$summary$abs_error)
+RMSE <- sqrt(mean((loo_forecast$summary$error)^2))
+
+cat("MAE  =", MAE, "\n")
+cat("RMSE =", RMSE, "\n")
+
+# ========================== Diagnostics ==========================
+diag_out <- gibbs_diagnostics(result_loo)
+
+print(diag_out$geweke)
+print(diag_out$ess)
+
+# ========================== Plots ==========================
+plot_trace(result_loo, param = "mu", indices = 1:3)
+plot_trace(result_loo, param = "b", indices = 1:3)
+plot_trace(result_loo, param = "y0", indices = 1:3)
+
+plot_trace(result_loo, param = "sigma2", indices = 1)
+plot_trace(result_loo, param = "theta1", indices = 1)
+plot_trace(result_loo, param = "theta2", indices = 1)
+plot_trace(result_loo, param = "rho1", indices = 1)
+plot_trace(result_loo, param = "rho2", indices = 1)
+plot_trace(result_loo, param = "rho3", indices = 1)
+
+print(plot_density(result_loo, "sigma2"))
+print(plot_density(result_loo, "theta1"))
+print(plot_density(result_loo, "theta2"))
+print(plot_density(result_loo, "rho1"))
+print(plot_density(result_loo, "rho2"))
+print(plot_density(result_loo, "rho3"))
+
+```
+
+
+
+# Prediction summaries
+
+```{r}
+## ==============================================================
+##  COPY-PASTE-READY CODE  –  SECOND-DIFFERENCE VERSION
+##  LEAVE-ONE-OUT FORECAST OF THE FINAL OBSERVATION
+## --------------------------------------------------------------
+##  Assumes:
+##    result_loo        – Gibbs output fitted to TRAINING sample only
+##                        i.e. the last row of MSA_data was left out
+##    MSA_data          – full Δ²√y series
+##    mdata             – full Δ√y series
+##    msa_data          – full √y series
+##    msa_data_level    – full original level series
+##
+##  Output
+##    pred_table  – PM, PSD, Bias, |Bias|/true, PRMSE, 95% HPDI
+##    err_table   – Mean, SD, CV, 95% HPDI for relative error
+## ==============================================================
+
+library(coda)
+
+# ---------------------------------------------------------------
+# 1. Helper – simulate left-out Δ²√y_T for every retained Gibbs draw
+# ---------------------------------------------------------------
+predict_leftout_diff2 <- function(gibbs_result, last_train_row) {
+  n_keep <- nrow(gibbs_result$mu)
+  L      <- ncol(gibbs_result$mu)
+  preds  <- matrix(NA_real_, n_keep, L)
+
+  for (s in seq_len(n_keep)) {
+    mu_s   <- gibbs_result$mu[s, ]
+    b_s    <- gibbs_result$b[s, ]
+    sig2_s <- gibbs_result$sigma2[s]
+
+    eps_s <- rnorm(L, mean = 0, sd = sqrt(sig2_s))
+    preds[s, ] <- mu_s + b_s * last_train_row + eps_s
+  }
+
+  preds
+}
+
+# ---------------------------------------------------------------
+# 2. Wrapper – forecast omitted last value and back-transform to level
+# ---------------------------------------------------------------
+predict_leftout_level_2diff <- function(gibbs_result,
+                                        MSA_data,        # full Δ²√y
+                                        mdata,           # full Δ√y
+                                        msa_data,        # full √y
+                                        msa_data_level,  # full y
+                                        prob = 0.95) {
+
+  L <- ncol(MSA_data)
+
+  # -------------------------------------------------------------
+  # Training/sample alignment for leave-one-out forecast
+  #
+  # Full transformed objects contain the last observation.
+  # Since the Gibbs sampler was fitted after dropping the last row
+  # of MSA_data, the forecast target is the omitted final row.
+  # -------------------------------------------------------------
+  T_full   <- nrow(MSA_data)
+  T_train  <- T_full - 1
+
+  # Last observed row used in estimation: Δ²√y_{T-1}
+  diff2_lag <- as.numeric(MSA_data[T_train, ])
+
+  # Omitted row we are forecasting: Δ²√y_T
+  diff2_true <- as.numeric(MSA_data[T_full, ])
+
+  # To undo one difference:
+  # Δ√y_T = Δ²√y_T + Δ√y_{T-1}
+  diff1_prev <- as.numeric(mdata[nrow(mdata) - 1, ])
+
+  # To undo the second difference:
+  # √y_T = Δ√y_T + √y_{T-1}
+  sqrt_prev <- as.numeric(msa_data[nrow(msa_data) - 1, ])
+
+  # True held-out level y_T
+  true_level <- as.numeric(msa_data_level[nrow(msa_data_level), ])
+
+  # -------------------------------------------------------------
+  # Simulate predictive draws for omitted Δ²√y_T
+  # -------------------------------------------------------------
+  diff2_preds <- predict_leftout_diff2(gibbs_result, diff2_lag)
+
+  # Undo 1st differencing: get Δ√ŷ_T
+  diff1_preds <- sweep(diff2_preds, 2, diff1_prev, "+")
+
+  # Undo 2nd differencing: get √ŷ_T
+  sqrt_preds <- sweep(diff1_preds, 2, sqrt_prev, "+")
+
+  # Undo square-root transform: get ŷ_T
+  level_preds <- sqrt_preds^2
+
+  # -------------------------------------------------------------
+  # Prediction summaries
+  # -------------------------------------------------------------
+  PM   <- colMeans(level_preds)
+  PSD  <- apply(level_preds, 2, sd)
+  Bias <- PM - true_level
+  PARB <- abs(Bias / true_level)
+  PRMSE <- sqrt(Bias^2 + PSD^2)
+
+  hpdi <- t(apply(level_preds, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  msa_names <- if (!is.null(colnames(MSA_data))) colnames(MSA_data) else paste0("MSA_", seq_len(L))
+
+  pred_table <- data.frame(
+    MSA       = msa_names,
+    True      = true_level,
+    PM        = PM,
+    PSD       = PSD,
+    Bias      = Bias,
+    PARB      = PARB,
+    PRMSE     = PRMSE,
+    HPDI      = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names = NULL
+  )
+
+  list(
+    diff2_true  = diff2_true,
+    level_preds = level_preds,
+    true_level  = true_level,
+    pred_table  = pred_table
+  )
+}
+
+# ---------------------------------------------------------------
+# 3. Relative-error summary
+# ---------------------------------------------------------------
+error_summary <- function(level_preds, true_level, prob = 0.95) {
+  L <- ncol(level_preds)
+
+  rel_err <- sweep(level_preds, 2, true_level, "-") / true_level
+
+  Mean_R <- colMeans(rel_err)
+  SD_R   <- apply(rel_err, 2, sd)
+  CV_R   <- ifelse(abs(Mean_R) < .Machine$double.eps, NA, SD_R / abs(Mean_R))
+
+  hpdi <- t(apply(rel_err, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  msa_names <- if (!is.null(colnames(level_preds))) colnames(level_preds) else paste0("MSA_", seq_len(L))
+
+  data.frame(
+    MSA  = msa_names,
+    Mean = Mean_R,
+    SD   = SD_R,
+    CV   = CV_R,
+    HPDI = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names = NULL
+  )
+}
+
+# ---------------------------------------------------------------
+# 4. RUN EVERYTHING
+# ---------------------------------------------------------------
+pred_out <- predict_leftout_level_2diff(
+  gibbs_result    = result_loo,   # use the leave-one-out Gibbs fit
+  MSA_data        = MSA_data,
+  mdata           = mdata,
+  msa_data        = msa_data,
+  msa_data_level  = msa_data_level
+)
+
+pred_table <- pred_out$pred_table
+err_table  <- error_summary(pred_out$level_preds, pred_out$true_level)
+
+# ---------------------------------------------------------------
+# 5. View results
+# ---------------------------------------------------------------
+cat("\n--- Prediction Metrics (leave-one-out final observation) ---\n")
+print(pred_table, right = FALSE, digits = 4)
+
+cat("\n--- Relative-Error Metrics ---\n")
+print(err_table, right = FALSE, digits = 4)
+
+write.csv(pred_table, "MTS_Pred_table_53.csv", row.names = FALSE)
+write.csv(err_table,  "MTS_Error_table_53.csv", row.names = FALSE)
+
+```
+
+
+# Prediction error summary
+
+```{r}
+
+# Load libraries
+library(HDInterval)
+library(dplyr)
+
+compute_Rit_summary <- function(pred_level,
+                                msa_data_level = NULL,
+                                true_level = NULL,
+                                cred_mass = 0.95) {
+  
+  if (is.null(true_level)) {
+    if (is.null(msa_data_level)) {
+      stop("Provide either true_level or msa_data_level.")
+    }
+    true_level <- as.numeric(msa_data_level[nrow(msa_data_level), ])
+  } else {
+    true_level <- as.numeric(true_level)
+  }
+
+  if (!is.matrix(pred_level)) {
+    pred_level <- as.matrix(pred_level)
+  }
+
+  if (ncol(pred_level) != length(true_level)) {
+    stop("Number of columns in pred_level must match length of true_level.")
+  }
+
+  # Relative prediction error:
+  # R_it = (yhat_T^(s) - y_T) / y_T
+  R_mat <- sweep(pred_level, 2, true_level, FUN = "-")
+  R_mat <- sweep(R_mat, 2, true_level, FUN = "/")
+
+  pm_rit  <- colMeans(R_mat)
+  psd_rit <- apply(R_mat, 2, sd)
+  hpdi <- t(apply(R_mat, 2, function(x) {
+    HDInterval::hdi(x, credMass = cred_mass)
+  }))
+
+  msa_names <- colnames(pred_level)
+  if (is.null(msa_names)) {
+    msa_names <- paste0("MSA_", seq_len(ncol(R_mat)))
+  }
+
+  df <- data.frame(
+    MSA     = msa_names,
+    PM = round(pm_rit, 4),
+    PSD = round(psd_rit, 4),
+    HPDI    = paste0("(", round(hpdi[, 1], 4), ", ", round(hpdi[, 2], 4), ")"),
+    row.names = NULL
+  )
+
+  return(df)
+}
+
+# pred_out came from predict_leftout_level_2diff(...)
+pred_level_v1 <- pred_out$level_preds
+true_level_v1 <- pred_out$true_level
+
+Rit_v1 <- compute_Rit_summary(
+  pred_level = pred_level_v1,
+  true_level = true_level_v1
+)
+
+print("📌 Prediction Error Summary — Leave-one-out forecast of final observation:")
+print(Rit_v1)
+
+```
+
