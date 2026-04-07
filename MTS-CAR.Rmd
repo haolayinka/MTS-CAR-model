@@ -1,0 +1,830 @@
+---
+title: "MTS-CAR"
+author: "Hammed Olayinka"
+date: "2026-04-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Required libraries
+
+```{r}
+library(tseries)
+library(urca)
+library(vars)
+library(dplyr)
+library(tidyr)
+library(MASS)
+library(coda)
+library(ggplot2)
+library(gridExtra)
+```
+
+## Data setup
+
+```{r}
+msa_data_level <- read.csv("MSA_data.csv", header = TRUE)
+msa_data <-sqrt(msa_data_level)
+mdata <- data.frame(lapply(msa_data, diff))
+MSA_data<-data.frame(lapply(msa_data, function(x) diff(x, differences = 2)))
+MSA_data<-as.matrix(MSA_data)
+head(MSA_data)
+```
+
+# Gibbs Sampler
+
+```{r}
+## ===================== PART 1: Setup & Core Builders =====================
+set.seed(44)
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(coda)
+})
+
+## 1) Data: leave out the last time point
+Y_full <- MSA_data   # full series
+Y_test <- Y_full[nrow(Y_full), , drop = FALSE]      # held-out last row
+Y <- Y_full[-nrow(Y_full), , drop = FALSE]          # training sample: rows 1,...,T-1
+
+W <- as.matrix(read.table("Dat2.csv", sep = ",", header = FALSE, stringsAsFactors = FALSE))
+
+T_full <- nrow(Y_full)
+Tt <- nrow(Y)     # training length = T-1
+l  <- ncol(Y)
+
+## 2) D and rho-interval from eigen(D^{-1}W)
+deg <- rowSums(W)
+if (any(deg <= 0)) stop("All diagonal elements of D must be >= 1.")
+D   <- Diagonal(l, x = as.numeric(deg))
+
+MinvW <- solve(as.matrix(D)) %*% W  # not symmetric in general
+lam <- Re(eigen(MinvW, symmetric = FALSE, only.values = TRUE)$values)
+lambda_min <- min(lam); lambda_max <- max(lam)
+rho_lower  <- 1 / lambda_min
+rho_upper  <- 1 / lambda_max
+
+## 3) Stacked designs
+build_designs <- function(Y, y0) {
+  Tt <- nrow(Y); l <- ncol(Y); stopifnot(length(y0) == l)
+  y_vec <- as.vector(t(Y))
+  Ylag <- rbind(y0, Y[1:(Tt - 1), , drop = FALSE])
+  ylag_vec <- as.vector(t(Ylag))
+  X <- cbind(Intercept = 1.0, Lag = ylag_vec)
+
+  Z0 <- matrix(0, Tt*l, l)
+  Z1 <- matrix(0, Tt*l, l)
+  row0 <- 1L
+  for (t in 1:Tt) {
+    idx <- row0:(row0 + l - 1L)
+    Z0[idx, ] <- diag(1, l)
+    Z1[idx, ] <- diag(ylag_vec[idx], nrow = l)
+    row0 <- row0 + l
+  }
+  list(y = y_vec, X = X, Z0 = Z0, Z1 = Z1, ylag_vec = ylag_vec)
+}
+
+## 4) Σ^{-1} blocks (CPD-consistent signs)
+## Σ1^{-1} = τ1^{-2}(D − ρ1 W),  Σ2^{-1} = τ2^{-2}(D − ρ2 W),  A = m0 I + m1 W
+## Σ^{-1} = [ A' Σ2^{-1} A + Σ1^{-1} ,  −A' Σ2^{-1} ;
+##           −Σ2^{-1} A             ,   Σ2^{-1}    ]
+build_Q <- function(D, W, tau1_sq, tau2_sq, rho1, rho2, m0, m1) {
+  l <- nrow(W)
+  A <- m0 * Diagonal(l) + m1 * W
+  S1p <- (1 / tau1_sq) * (D - rho1 * W)
+  S2p <- (1 / tau2_sq) * (D - rho2 * W)
+  B11 <- S1p + t(A) %*% S2p %*% A
+  B12 <- - t(A) %*% S2p
+  B21 <- - S2p %*% A
+  B22 <- S2p
+  Q <- rbind(cbind(as.matrix(B11), as.matrix(B12)),
+             cbind(as.matrix(B21), as.matrix(B22)))
+  0.5 * (Q + t(Q))
+}
+
+## 5) Distributions
+rinvgamma <- function(n, shape, scale) 1 / rgamma(n, shape = shape, rate = 1 / scale)
+
+## Gaussian from precision: chol with safe eigen fallback (correct covariance = P^{-1})
+rmvnorm_from_prec <- function(mu, P) {
+  P <- 0.5 * (P + t(P))
+  k <- length(mu)
+  z <- rnorm(k)
+  ch <- try(chol(P), silent = TRUE)
+  if (!inherits(ch, "try-error")) {
+    return(as.numeric(mu + backsolve(ch, z)))
+  } else {
+    ee <- eigen(P, symmetric = TRUE)
+    lam <- ee$values
+    vmax <- max(1, max(abs(lam))); eps <- .Machine$double.eps * vmax
+    lam <- pmax(lam, eps)
+    return(as.numeric(mu + ee$vectors %*% (z / sqrt(lam))))
+  }
+}
+
+## 6) OLS initializer
+init_from_ols <- function(Y, y0) {
+  des <- build_designs(Y, y0)
+  y <- des$y; X <- des$X
+  theta_ols <- as.numeric(solve(crossprod(X), crossprod(X, y)))
+  resid <- y - X %*% theta_ols
+  sigma2_ols <- as.numeric(crossprod(resid) / length(resid))
+  list(theta = theta_ols, sigma2 = sigma2_ols, des = des)
+}
+
+## --------- Quick check ----------
+y0_start <- as.numeric(Y[1, ])
+chk <- init_from_ols(Y, y0_start)
+str(list(
+  rho_interval = c(lower = rho_lower, upper = rho_upper),
+  theta_init   = chk$theta,
+  sigma2_init  = chk$sigma2,
+  dims = c(T = Tt, l = l),
+  X_head = head(chk$des$X),
+  Z0_block_ok = all(chk$des$Z0[1:l, ] == diag(1, l))
+))
+
+## ===================== PART 1b: Initial values ============================
+
+## Ginv_and_Ginvh for (m0,m1) CPD
+Ginv_and_Ginvh <- function(nu1, nu2, D, W, rho2) {
+  Sig_tilde <- solve(as.matrix(D - rho2 * W))
+  SigW      <- Sig_tilde %*% W
+  WSigW     <- W %*% Sig_tilde %*% W
+  s00 <- as.numeric(crossprod(nu2, Sig_tilde %*% nu2))
+  s01 <- as.numeric(crossprod(nu2, SigW %*% nu2))
+  s11 <- as.numeric(crossprod(nu2, WSigW %*% nu2))
+  h0  <- as.numeric(crossprod(nu1, Sig_tilde %*% nu2))
+  h1  <- as.numeric(crossprod(nu1, SigW %*% nu2))
+  G <- matrix(c(s00, s01, s01, s11), nrow = 2, byrow = TRUE)
+  Ginv  <- solve(G)
+  Ginvh <- as.numeric(Ginv %*% c(h0, h1))
+  list(Ginv = Ginv, Ginvh = Ginvh)
+}
+
+## per-MSA OLS
+per_msa_ols <- function(Y) {
+  Tt <- nrow(Y); l <- ncol(Y)
+  alpha_hat <- beta_hat <- numeric(l)
+  for (i in 1:l) {
+    yi  <- Y[2:Tt, i]
+    Xi  <- cbind(1.0, Y[1:(Tt - 1), i])
+    bh  <- solve(crossprod(Xi), crossprod(Xi, yi))
+    alpha_hat[i] <- bh[1]; beta_hat[i] <- bh[2]
+  }
+  list(alpha = alpha_hat, beta = beta_hat)
+}
+
+## 1) pooled OLS
+init_ols <- init_from_ols(Y, y0 = colMeans(Y))
+theta_init  <- init_ols$theta
+sigma2_init <- init_ols$sigma2
+
+## 2) centered effects
+msa <- per_msa_ols(Y)
+nu1_init <- msa$alpha - theta_init[1]
+nu2_init <- msa$beta  - theta_init[2]
+nu_init  <- c(nu1_init, nu2_init)
+
+## 3) y0 and hyperparams
+mu0_init       <- mean(Y)
+sigma0_sq_init <- stats::var(as.vector(Y))
+alpha_i <- theta_init[1] + nu1_init
+beta_i  <- theta_init[2] + nu2_init
+y1_vec  <- as.numeric(Y[1, ])
+A_vec   <- (beta_i^2) / sigma2_init + 1 / sigma0_sq_init
+B_vec   <- beta_i * (y1_vec - alpha_i) / sigma2_init + mu0_init / sigma0_sq_init
+y0_init <- B_vec / A_vec + rnorm(l, sd = sqrt(1 / A_vec))
+
+## 4) rho init
+rho_mid   <- 0.5 * (rho_lower + rho_upper)
+rho1_init <- rho_mid; rho2_init <- rho_mid
+
+## 5) tau init by matching variances
+A1_inv <- solve(as.matrix(D - rho1_init * W))
+A2_inv <- solve(as.matrix(D - rho2_init * W))
+avg_var1 <- mean(diag(A1_inv)); avg_var2 <- mean(diag(A2_inv))
+var_emp1 <- stats::var(nu1_init); var_emp2 <- stats::var(nu2_init)
+tau1_sq_init <- if (var_emp1 > 0) avg_var1 / var_emp1 else 1
+tau2_sq_init <- if (var_emp2 > 0) avg_var2 / var_emp2 else 1
+
+## 6) (m0,m1) from CPD mean
+Gbits  <- Ginv_and_Ginvh(nu1 = nu1_init, nu2 = nu2_init, D = D, W = W, rho2 = rho2_init)
+m_init <- as.numeric(Gbits$Ginvh)
+m0_init <- m_init[1]; m1_init <- m_init[2]
+
+initial_values <- list(
+  theta  = theta_init,
+  sigma2 = sigma2_init,
+  nu1    = nu1_init,
+  nu2    = nu2_init,
+  nu     = nu_init,
+  y0     = y0_init,
+  mu0    = mu0_init,
+  sigma0_sq = sigma0_sq_init,
+  rho1   = rho1_init,
+  rho2   = rho2_init,
+  tau1_sq= tau1_sq_init,
+  tau2_sq= tau2_sq_init,
+  m0     = m0_init,
+  m1     = m1_init,
+  rho_interval = c(lower = rho_lower, upper = rho_upper)
+)
+
+# ========================= Gibbs Sampler with phi = theta + nu ==========================
+
+gibbs_semi_collapsed <- function(Y, W, D, initial_values,
+                                 n_iter = 1500, burn = 500, thin = 1,
+                                 rho_grid_len = 100, verbose = TRUE) {
+
+  library(Matrix)
+
+  # Helper: fast multivariate normal from precision
+  rmvnorm_from_prec <- function(mu, Prec) {
+    R <- chol(Prec)
+    z <- rnorm(length(mu))
+    as.numeric(mu + backsolve(R, z))
+  }
+
+  Y <- as.matrix(Y); Tt <- nrow(Y); l <- ncol(Y)
+
+  # Rho grid
+  rho_lower <- initial_values$rho_interval[1]
+  rho_upper <- initial_values$rho_interval[2]
+  rho_grid  <- seq(rho_lower + 1e-8, rho_upper - 1e-8, length.out = rho_grid_len)
+
+  # Design matrices
+  y0_dummy <- initial_values$y0
+  des_all  <- build_designs(Y, y0_dummy)
+  X_static <- des_all$X
+  Z0_full  <- des_all$Z0
+  Z1_base  <- des_all$Z1
+  y <- des_all$y
+
+  # State initialization
+  theta  <- initial_values$theta
+  sigma2 <- initial_values$sigma2
+  nu1    <- initial_values$nu1
+  nu2    <- initial_values$nu2
+  y0     <- initial_values$y0
+  mu0    <- initial_values$mu0
+  sigma0_sq <- initial_values$sigma0_sq
+  rho1   <- initial_values$rho1
+  rho2   <- initial_values$rho2
+  tau1_sq<- initial_values$tau1_sq
+  tau2_sq<- initial_values$tau2_sq
+  m0     <- initial_values$m0
+  m1     <- initial_values$m1
+
+  keep <- seq(burn + 1, n_iter, by = thin)
+  S    <- length(keep)
+
+  out <- list(
+    theta = matrix(NA_real_, S, 2, dimnames = list(NULL, c("theta0","theta1"))),
+    sigma2 = numeric(S), tau1_sq = numeric(S), tau2_sq = numeric(S),
+    rho1 = numeric(S), rho2 = numeric(S), m0 = numeric(S), m1 = numeric(S),
+    nu1_draws = matrix(NA_real_, S, l), nu2_draws = matrix(NA_real_, S, l),
+    y0_draws  = matrix(NA_real_, S, l),
+    Q_list = vector("list", S),
+    X_list = vector("list", S),
+    Z_list = vector("list", S)
+  )
+
+  # Precompute for rho grid
+  Dm12 <- Diagonal(l, 1 / sqrt(diag(D)))
+  Ssym <- Dm12 %*% W %*% Dm12
+  lamS <- eigen(Ssym, symmetric = TRUE, only.values = TRUE)$values
+  logdet_D <- sum(log(diag(D)))
+
+  # Helper: rho sampling
+  sample_rho_fast <- function(grid, a_vec, tau_sq) {
+    log_kernel <- function(rho) {
+      logdet <- logdet_D + sum(log(1 - rho * lamS))
+      quad   <- as.numeric(crossprod(a_vec, (D - rho * W) %*% a_vec))
+      0.5 * logdet - 0.5 * quad / tau_sq
+    }
+    lp <- vapply(grid, log_kernel, numeric(1))
+    w <- exp(lp - max(lp)); w[!is.finite(w)] <- 0
+    if (sum(w) == 0) w[] <- 1
+    sample(grid, 1, prob = w)
+  }
+
+  # ---------------- MAIN GIBBS LOOP ----------------
+  s <- 0
+  for (it in 1:n_iter) {
+
+    # --- Step 1: y0 | ·
+    alpha <- theta[1] + nu1
+    beta  <- theta[2] + nu2
+    y1    <- Y[1, ]
+    A_vec <- (beta^2) / sigma2 + 1 / sigma0_sq
+    B_vec <- beta * (y1 - alpha) / sigma2 + mu0 / sigma0_sq
+    y0    <- rnorm(l, mean = B_vec / A_vec, sd = sqrt(1 / A_vec))
+
+    # --- Step 2: update design matrices
+    Z1_full <- Z1_base
+    Z1_full[1:l, ] <- diag(y0, nrow = l)
+    Z <- cbind(Z0_full, Z1_full)
+    X <- X_static
+
+    # --- Step 3: Q precision (CAR)
+    Q <- build_Q(D, W, tau1_sq, tau2_sq, rho1, rho2, m0, m1)
+
+    # --- Step 4: σ² | y, θ, ν (conjugate)
+    resid <- y - X %*% theta - Z %*% c(nu1, nu2)
+    K <- as.numeric(crossprod(resid))
+    sigma2 <- rinvgamma(1, shape = (Tt * l)/2, scale = K/2)
+
+    # --- Step 5: Block (θ, ν) | σ²
+    Zt <- t(Z)
+    ZtZ <- crossprod(Z)
+    XtX <- crossprod(X)
+    ZtX <- crossprod(Z, X)
+    Zty <- crossprod(Z, y)
+    Xty <- crossprod(X, y)
+
+    # θ | y, σ² (integrating out ν)
+    M  <- Q + (1/sigma2) * ZtZ
+    R  <- chol(M)
+    Minv_Zty <- backsolve(R, forwardsolve(t(R), Zty))
+    Vinv_y <- (1/sigma2) * y - (1/sigma2)^2 * (Z %*% Minv_Zty)
+
+    XVX <- XtX / sigma2 - (1/sigma2)^2 * crossprod(ZtX, solve(M, ZtX))
+    XVy <- Xty / sigma2 - (1/sigma2)^2 * crossprod(ZtX, Minv_Zty)
+    mu_theta <- solve(XVX, XVy)
+    theta <- rmvnorm_from_prec(mu_theta, XVX)
+
+    # ν | y, θ, σ²
+    V0 <- (1/sigma2) * ZtZ + Q
+    Va <- (1/sigma2) * crossprod(Z, y - X %*% theta)
+    mu_nu <- solve(V0, Va)
+    nu <- rmvnorm_from_prec(mu_nu, V0)
+    nu1 <- nu[1:l]
+    nu2 <- nu[(l+1):(2*l)]
+
+    # --- Step 6: τ_s² | ·
+    A_mat <- m0 * Diagonal(l) + m1 * W
+    a1 <- nu1
+    a2 <- as.numeric(nu2 - A_mat %*% nu1)
+    Q1 <- as.numeric(crossprod(a1, (D - rho1 * W) %*% a1))
+    Q2 <- as.numeric(crossprod(a2, (D - rho2 * W) %*% a2))
+    tau1_sq <- rinvgamma(1, l/2, Q1/2)
+    tau2_sq <- rinvgamma(1, l/2, Q2/2)
+
+    # --- Step 7: ρ_s | ·
+    rho1 <- sample_rho_fast(rho_grid, a1, tau1_sq)
+    rho2 <- sample_rho_fast(rho_grid, a2, tau2_sq)
+
+    # --- Step 8: (m0, m1) | ·
+   draw_m0m1 <- function(nu1, nu2, D, W, rho2) {
+  Sig_tilde <- solve(as.matrix(D - rho2 * W))
+  v2_Sig_v2   <- as.numeric(crossprod(nu2, Sig_tilde %*% nu2))
+  v2_SigW_v2  <- as.numeric(crossprod(nu2, Sig_tilde %*% (W %*% nu2)))
+  v2_WSigW_v2 <- as.numeric(crossprod(nu2, (W %*% Sig_tilde %*% W) %*% nu2))
+  v2_Sig_v1   <- as.numeric(crossprod(nu2, Sig_tilde %*% nu1))
+  v2_WSig_v1  <- as.numeric(crossprod(nu2, (W %*% Sig_tilde) %*% nu1))
+  Delta_tilde <- v2_WSigW_v2 * v2_Sig_v2 - (v2_SigW_v2)^2
+  Ginv <- (1 / Delta_tilde) * matrix(c(v2_WSigW_v2, -v2_SigW_v2,
+                                       -v2_SigW_v2, v2_Sig_v2), nrow = 2, byrow = TRUE)
+  Ginv_h <- (1 / Delta_tilde) * c(
+    v2_WSigW_v2 * v2_Sig_v1 - v2_SigW_v2 * v2_WSig_v1,
+    v2_Sig_v2   * v2_WSig_v1 - v2_SigW_v2 * v2_Sig_v1
+  )
+  m_mean <- as.numeric(Ginv_h)
+  m_prec <- solve(Ginv)
+  m_draw <- rmvnorm_from_prec(m_mean, m_prec)
+  c(m0 = m_draw[1], m1 = m_draw[2])
+}
+
+m_draw <- draw_m0m1(nu1, nu2, D, W, rho2)
+m0 <- m_draw["m0"]
+m1 <- m_draw["m1"]
+
+    # --- Save draws
+    if (it %in% keep) {
+      s <- s + 1
+      out$theta[s, ] <- theta
+      out$sigma2[s]  <- sigma2
+      out$tau1_sq[s] <- tau1_sq
+      out$tau2_sq[s] <- tau2_sq
+      out$rho1[s]    <- rho1
+      out$rho2[s]    <- rho2
+      out$m0[s]      <- m0
+      out$m1[s]      <- m1
+      out$nu1_draws[s, ] <- nu1
+      out$nu2_draws[s, ] <- nu2
+      out$y0_draws[s, ]  <- y0
+      out$Q_list[[s]] <- Q
+      out$X_list[[s]] <- X
+      out$Z_list[[s]] <- Z
+    }
+
+    if (verbose && it %% 1000 == 0) cat("iter:", it, " saved:", s, "\n")
+  }
+
+  attr(out, "keep") <- keep
+  return(out)
+}
+
+
+## ============================== RUN =======================================
+fit <- gibbs_semi_collapsed(
+  Y, W, D, initial_values,
+  n_iter = 1500, burn = 500, thin = 1,
+  rho_grid_len = 100, verbose = FALSE
+)
+
+# store training and held-out data for convenience
+fit$Y_train <- Y
+fit$Y_test  <- Y_test
+fit$Y_full  <- Y_full
+## ==========================================================================
+
+## ========================= PART 3: Diagnostics (unchanged) =================
+suppressPackageStartupMessages({
+  library(coda)
+  library(ggplot2)
+  library(gridExtra)
+  library(reshape2)
+})
+
+## 0) Utilities ---------------------------------------------------------------
+
+# Convert sampler output -> coda::mcmc, including per-MSA streams if present
+as_mcmc_from_fit <- function(fit) {
+  stopifnot(!is.null(fit$theta), ncol(fit$theta) == 2)
+
+  core <- cbind(
+    theta0  = fit$theta[, 1],
+    theta1  = fit$theta[, 2],
+    sigma2  = fit$sigma2,
+    tau1_sq = fit$tau1_sq,
+    tau2_sq = fit$tau2_sq,
+    rho1    = fit$rho1,
+    rho2    = fit$rho2,
+    m0      = fit$m0,
+    m1      = fit$m1
+  )
+
+  # attach per-MSA draws if present
+  add <- function(mat, prefix) {
+    if (!is.null(mat) && is.matrix(mat) && nrow(mat) == nrow(core)) {
+      l <- ncol(mat)
+      colnames(mat) <- paste0(prefix, "_MSA", seq_len(l))
+      return(mat)
+    } else {
+      return(NULL)
+    }
+  }
+
+  nu1_block <- add(fit$nu1_draws, "nu1")
+  nu2_block <- add(fit$nu2_draws, "nu2")
+  y0_block  <- add(fit$y0_draws , "y0")
+
+  X <- core
+  if (!is.null(nu1_block)) X <- cbind(X, nu1_block)
+  if (!is.null(nu2_block)) X <- cbind(X, nu2_block)
+  if (!is.null(y0_block))  X <- cbind(X, y0_block)
+
+  coda::mcmc(X)
+}
+
+# Tidy
+to_long_df <- function(mcmc_obj) {
+  df <- as.data.frame(mcmc_obj)
+  df$iter <- seq_len(nrow(df))
+  reshape2::melt(df, id.vars = "iter", variable.name = "param", value.name = "value")
+}
+
+# Plot helpers
+trace_plot <- function(df_long, params, ncol = 3, title = "Trace plots") {
+  plots <- lapply(params, function(p) {
+    ggplot(df_long[df_long$param == p, ], aes(iter, value)) +
+      geom_line() +
+      labs(x = "Kept iteration", y = p) +
+      theme_minimal(base_size = 12)
+  })
+  gridExtra::grid.arrange(grobs = plots, ncol = ncol, top = title)
+}
+
+density_plot <- function(df_long, params, ncol = 3, title = "Posterior densities") {
+  plots <- lapply(params, function(p) {
+    ggplot(df_long[df_long$param == p, ], aes(value)) +
+      geom_density() +
+      labs(x = p, y = "Density") +
+      theme_minimal(base_size = 12)
+  })
+  gridExtra::grid.arrange(grobs = plots, ncol = ncol, top = title)
+}
+
+paginate <- function(vec, page_size = 12) {
+  split(vec, ceiling(seq_along(vec) / page_size))
+}
+
+## 1) Build mcmc object ------------------------------------------------------
+mcmc_fit <- as_mcmc_from_fit(fit)
+df_long  <- to_long_df(mcmc_fit)
+
+## 2) Geweke Z and two-sided p-values ---------------------------------------
+gw <- coda::geweke.diag(mcmc_fit, frac1 = 0.49, frac2 = 0.5)$z
+geweke_tbl <- data.frame(param = names(gw), Z = as.numeric(gw))
+geweke_tbl$p_value <- 2 * pnorm(-abs(geweke_tbl$Z))
+row.names(geweke_tbl) <- NULL
+
+cat("\n===== Geweke test (Z and p-value) =====\n")
+print(geweke_tbl, row.names = FALSE, digits = 4)
+
+## 3) Effective Sample Size (ESS) -------------------------------------------
+ess <- coda::effectiveSize(mcmc_fit)
+ess_tbl <- data.frame(param = names(ess), ESS = as.numeric(ess))
+row.names(ess_tbl) <- NULL
+
+cat("\n===== Effective Sample Size (ESS) =====\n")
+print(ess_tbl, row.names = FALSE)
+
+## 4) Trace and density plots ------------------------------------------------
+# Globals
+globals <- c("theta0","theta1","sigma2","tau1_sq","tau2_sq","rho1","rho2","m0","m1")
+globals <- globals[globals %in% unique(df_long$param)]
+if (length(globals)) {
+  trace_plot(df_long, globals, ncol = 3, title = "Trace: global parameters")
+  density_plot(df_long, globals, ncol = 3, title = "Densities: global parameters")
+}
+
+# Per-MSA (if present)
+nu1_params <- sort(unique(grep("^nu1_MSA", df_long$param, value = TRUE)))
+nu2_params <- sort(unique(grep("^nu2_MSA", df_long$param, value = TRUE)))
+y0_params  <- sort(unique(grep("^y0_MSA",  df_long$param, value = TRUE)))
+
+if (length(nu1_params)) {
+  for (pg in paginate(nu1_params, page_size = 12)) {
+    trace_plot(df_long, pg, ncol = 3, title = sprintf("Trace: nu1 (%d shown)", length(pg)))
+  }
+  for (pg in paginate(nu1_params, page_size = 12)) {
+    density_plot(df_long, pg, ncol = 3, title = sprintf("Densities: nu1 (%d shown)", length(pg)))
+  }
+}
+if (length(nu2_params)) {
+  for (pg in paginate(nu2_params, page_size = 12)) {
+    trace_plot(df_long, pg, ncol = 3, title = sprintf("Trace: nu2 (%d shown)", length(pg)))
+  }
+  for (pg in paginate(nu2_params, page_size = 12)) {
+    density_plot(df_long, pg, ncol = 3, title = sprintf("Densities: nu2 (%d shown)", length(pg)))
+  }
+}
+if (length(y0_params)) {
+  for (pg in paginate(y0_params, page_size = 12)) {
+    trace_plot(df_long, pg, ncol = 3, title = sprintf("Trace: y0 (%d shown)", length(pg)))
+  }
+  for (pg in paginate(y0_params, page_size = 12)) {
+    density_plot(df_long, pg, ncol = 3, title = sprintf("Densities: y0 (%d shown)", length(pg)))
+  }
+}
+
+## 5) Quick convergence flags (heuristics) ----------------------------------
+conv <- merge(geweke_tbl, ess_tbl, by = "param", all = TRUE)
+conv$pass_geweke <- with(conv, p_value > 0.05)
+conv$pass_ess    <- with(conv, ESS > 600)   # adjust threshold if needed
+
+cat("\n===== Quick convergence flags =====\n")
+print(conv[, c("param","Z","p_value","ESS","pass_geweke","pass_ess")],
+      row.names = FALSE, digits = 4)
+
+## 6) Note if per-MSA streams missing ---------------------------------------
+if (!length(nu1_params) || !length(nu2_params)) {
+  message("\nNOTE: Per-MSA draws not found. To store them in Part 2, inside the save block add:\n",
+          "  if (s == 1) {\n",
+          "    out$nu1_draws <- matrix(NA_real_, S, l)\n",
+          "    out$nu2_draws <- matrix(NA_real_, S, l)\n",
+          "    out$y0_draws  <- matrix(NA_real_, S, l)\n",
+          "  }\n",
+          "  out$nu1_draws[s, ] <- nu1\n",
+          "  out$nu2_draws[s, ] <- nu2\n",
+          "  out$y0_draws[s, ]  <- y0\n")
+}
+## =====================================================================================
+
+```
+
+
+
+# Prediction
+
+```{r}
+## ==============================================================
+##  PART 4 – Posterior Prediction and Error Diagnostics
+##  -------------------------------------------------------------
+##  Assumes:
+##    - fit was obtained by fitting the Gibbs sampler to rows 1,...,T-1
+##    - MSA_data, mdata, msa_data, msa_data_level are the FULL series
+##    - the final row is the left-out forecast target
+## ==============================================================
+
+suppressPackageStartupMessages({
+  library(coda)
+  library(dplyr)
+})
+
+# ---------------------------------------------------------------
+# 1. Helper – simulate left-out Δ²√y_T for every retained draw
+# ---------------------------------------------------------------
+predict_leftout_diff2 <- function(fit, last_train_diff2_row) {
+  n_keep <- nrow(fit$theta)
+  L      <- ncol(fit$nu1_draws)
+  preds  <- matrix(NA_real_, n_keep, L)
+
+  for (s in seq_len(n_keep)) {
+    th0  <- fit$theta[s, 1]
+    th1  <- fit$theta[s, 2]
+    nu1s <- fit$nu1_draws[s, ]
+    nu2s <- fit$nu2_draws[s, ]
+    sig2 <- fit$sigma2[s]
+
+    eps <- rnorm(L, mean = 0, sd = sqrt(sig2))
+
+    # predictive draw for omitted final transformed value
+    preds[s, ] <- (th0 + nu1s) + (th1 + nu2s) * last_train_diff2_row + eps
+  }
+
+  preds
+}
+
+# ---------------------------------------------------------------
+# 2. Wrapper – forecast omitted last value and back-transform
+# ---------------------------------------------------------------
+predict_leftout_level_2diff <- function(fit,
+                                        MSA_data,       # full Δ²√y series
+                                        mdata,          # full Δ√y series
+                                        msa_data,       # full √y series
+                                        msa_data_level, # full level series
+                                        prob = 0.95) {
+
+  T_full <- nrow(MSA_data)
+  L      <- ncol(MSA_data)
+
+  if (T_full < 2) stop("Need at least 2 rows in MSA_data to do leave-one-out forecasting.")
+
+  # -------------------------------------------------------------
+  # Left-out target is the LAST row of the full transformed series
+  # Training fit used rows 1,...,T_full-1
+  # -------------------------------------------------------------
+  diff2_lag  <- as.numeric(MSA_data[T_full - 1, ])     # last observed training row
+  diff2_true <- as.numeric(MSA_data[T_full, ])         # omitted Δ²√y_T
+
+  # To undo differencing:
+  # Δ√y_T = Δ²√y_T + Δ√y_{T-1}
+  diff1_prev <- as.numeric(mdata[nrow(mdata) - 1, ])
+
+  # √y_T = Δ√y_T + √y_{T-1}
+  sqrt_prev  <- as.numeric(msa_data[nrow(msa_data) - 1, ])
+
+  # true omitted level value
+  true_level <- as.numeric(msa_data_level[nrow(msa_data_level), ])
+
+  # predictive draws for omitted Δ²√y_T
+  diff2_preds <- predict_leftout_diff2(fit, diff2_lag)
+
+  # Undo one difference  ->  Δ√ŷ_T
+  diff1_preds <- sweep(diff2_preds, 2, diff1_prev, "+")
+
+  # Undo second difference  ->  √ŷ_T
+  sqrt_preds  <- sweep(diff1_preds, 2, sqrt_prev, "+")
+
+  # Undo sqrt transform  ->  ŷ_T
+  level_preds <- sqrt_preds^2
+
+  # Prediction summaries
+  PM   <- colMeans(level_preds)
+  PSD  <- apply(level_preds, 2, sd)
+  Bias <- PM - true_level
+  PARB <- abs(Bias / true_level)
+  PRMSE <- sqrt(Bias^2 + PSD^2)
+
+  hpdi <- t(apply(level_preds, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  msa_names <- colnames(msa_data_level)
+  if (is.null(msa_names)) msa_names <- paste0("MSA_", seq_len(L))
+
+  pred_table <- data.frame(
+    MSA        = msa_names,
+    True       = true_level,
+    PM         = PM,
+    PSD        = PSD,
+    Bias       = Bias,
+    PARB       = PARB,
+    PRMSE      = PRMSE,
+    HPDI       = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names  = NULL
+  )
+
+  list(
+    diff2_true  = diff2_true,
+    level_preds = level_preds,
+    true_level  = true_level,
+    pred_table  = pred_table
+  )
+}
+
+# ---------------------------------------------------------------
+# 3. Relative-error summary for the LEFT-OUT value
+# ---------------------------------------------------------------
+error_summary <- function(level_preds, true_level, prob = 0.95) {
+
+  n_draws <- nrow(level_preds)
+  L       <- ncol(level_preds)
+
+  # R_it = (pred - true) / true
+  rel_err <- sweep(level_preds, 2, true_level, "-")
+  rel_err <- sweep(rel_err, 2, true_level, "/")
+
+  Mean_R <- colMeans(rel_err)
+  SD_R   <- apply(rel_err, 2, sd)
+
+  # Monte Carlo standard error of posterior mean of R_it
+  MCSE_mean <- SD_R / sqrt(n_draws)
+
+  CV_R <- ifelse(abs(Mean_R) < .Machine$double.eps, NA_real_,
+                 SD_R / abs(Mean_R))
+
+  hpdi <- t(apply(rel_err, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  msa_names <- colnames(level_preds)
+  if (is.null(msa_names)) msa_names <- paste0("MSA_", seq_len(L))
+
+  data.frame(
+    MSA       = msa_names,
+    Mean      = Mean_R,
+    SD        = SD_R,
+    MCSE_mean = MCSE_mean,
+    CV        = CV_R,
+    HPDI      = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names = NULL
+  )
+}
+
+# ---------------------------------------------------------------
+# 4. RUN EVERYTHING
+# ---------------------------------------------------------------
+pred_out <- predict_leftout_level_2diff(
+  fit            = fit,
+  MSA_data       = MSA_data,
+  mdata          = mdata,
+  msa_data       = msa_data,
+  msa_data_level = msa_data_level
+)
+
+pred_table <- pred_out$pred_table
+err_table  <- error_summary(pred_out$level_preds, pred_out$true_level)
+
+# ---------------------------------------------------------------
+# 5. View results
+# ---------------------------------------------------------------
+cat("\n--- Posterior Prediction Metrics (leave-one-out final observation) ---\n")
+print(pred_table, right = FALSE, digits = 3)
+
+cat("\n--- Relative-Error Metrics for left-out value ---\n")
+print(err_table, right = FALSE, digits = 3)
+
+#write.csv(pred_table, "Pred_table_RSE.csv", row.names = FALSE)
+#write.csv(err_table, "Error_table_RSE.csv", row.names = FALSE)
+```
+
+
+# Gelman-Rubin Diagnostic Test
+
+```{r}
+## 7) PSRF (Potential Scale Reduction Factor) using pseudo-chains ------------
+# Split chain into 2 equal halves
+split_mcmc_to_list <- function(mcmc_obj, n_parts = 2) {
+  stopifnot(inherits(mcmc_obj, "mcmc"))
+  n <- nrow(mcmc_obj)
+  chunk_size <- floor(n / n_parts)
+  chunks <- vector("list", n_parts)
+  for (i in seq_len(n_parts)) {
+    start <- (i - 1) * chunk_size + 1
+    end <- if (i == n_parts) n else i * chunk_size
+    chunks[[i]] <- coda::mcmc(mcmc_obj[start:end, ])
+  }
+  coda::mcmc.list(chunks)
+}
+
+
+library(coda)
+
+# Split into 2 pseudo-chains
+pseudo_chains <- split_mcmc_to_list(mcmc_fit, n_parts = 2)
+
+# Compute Gelman-Rubin PSRF
+psrf_result <- gelman.diag(pseudo_chains, autoburnin = FALSE)
+
+cat("\n===== Potential Scale Reduction Factor (PSRF) =====\n")
+print(psrf_result$psrf, digits = 4)
+
+
+```

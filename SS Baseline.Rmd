@@ -1,0 +1,474 @@
+---
+title: "SS Model"
+author: "Hammed Olayinka"
+date: "2026-04-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data setup
+
+```{r}
+msa_data_level <- read.csv("MSA_data.csv", header = TRUE)
+msa_data <-sqrt(msa_data_level)
+mdata <- data.frame(lapply(msa_data, diff))
+MSA_data<-data.frame(lapply(msa_data, function(x) diff(x, differences = 2)))
+MSA_data<-as.matrix(MSA_data)
+head(MSA_data)
+```
+
+
+
+```{r}
+## ==============================================================
+## SINGLE-SERIES (SS) BASELINE MODEL
+## --------------------------------------------------------------
+##   - a0 = 2
+##   - b0 = 2
+##   - grid_len = 100
+##   - beta_prior_mean = OLS estimate from regressing Y on lag(Y)
+## ==============================================================
+
+suppressPackageStartupMessages({
+  library(coda)
+  library(dplyr)
+})
+
+set.seed(44)
+
+## --------------------------------------------------------------
+## 0) Leave-one-out split
+## --------------------------------------------------------------
+Y_full  <- as.matrix(MSA_data)
+Y_test  <- Y_full[nrow(Y_full), , drop = FALSE]
+Y_train <- Y_full[-nrow(Y_full), , drop = FALSE]
+
+T_full <- nrow(Y_full)
+Tt     <- nrow(Y_train)
+L      <- ncol(Y_train)
+
+if (Tt < 2) stop("Need at least 2 training observations after leaving out the last row.")
+
+## --------------------------------------------------------------
+## 1) Utilities
+## --------------------------------------------------------------
+rinvgamma1 <- function(shape, scale) {
+  1 / rgamma(1, shape = shape, rate = 1 / scale)
+}
+
+rmvnorm_chol <- function(mu, Sigma) {
+  R <- chol(Sigma)
+  as.numeric(mu + t(R) %*% rnorm(length(mu)))
+}
+
+build_X_single <- function(y_train, y0) {
+  n <- length(y_train)
+  xlag <- c(y0, y_train[1:(n - 1)])
+  cbind(Intercept = 1, Lag = xlag)
+}
+
+## OLS estimate by regressing Y on its lag values
+## Uses rows 2,...,T and lags from rows 1,...,T-1
+ols_beta_from_lags <- function(y_train) {
+  y_train <- as.numeric(y_train)
+  n <- length(y_train)
+  if (n < 2) stop("Need at least 2 observations for OLS lag regression.")
+
+  y_resp <- y_train[2:n]
+  x_lag  <- y_train[1:(n - 1)]
+
+  X_ols <- cbind(Intercept = 1, Lag = x_lag)
+  as.numeric(solve(crossprod(X_ols), crossprod(X_ols, y_resp)))
+}
+
+## --------------------------------------------------------------
+## 2) Posterior pieces at fixed y0
+## --------------------------------------------------------------
+posterior_components_y0 <- function(y_train, y0,
+                                    beta_prior_mean,
+                                    Sigma0,
+                                    a0,
+                                    b0) {
+  y_train <- as.numeric(y_train)
+  X <- build_X_single(y_train, y0)
+  y <- y_train
+
+  S0_inv <- solve(Sigma0)
+  XtX    <- crossprod(X)
+  Xty    <- crossprod(X, y)
+
+  ## posterior precision and mean for beta | sigma2, y0, y
+  Pn <- XtX + S0_inv
+  mn <- solve(Pn, Xty + S0_inv %*% beta_prior_mean)
+
+  ## OLS estimate using X(y0)
+  beta_hat <- solve(XtX, Xty)
+
+  ## b_(y0) matching the stated framework
+  resid_hat <- y - X %*% beta_hat
+  term1 <- as.numeric(crossprod(resid_hat))
+
+  term2 <- as.numeric(
+    t(beta_hat - beta_prior_mean) %*%
+      XtX %*%
+      solve(XtX + S0_inv) %*%
+      S0_inv %*%
+      (beta_hat - beta_prior_mean)
+  )
+
+  b_y0 <- term1 + term2 + b0
+
+  if (!is.finite(b_y0) || b_y0 <= 0) {
+    return(list(log_post = -Inf, Pn = Pn, mn = mn, b_y0 = NA_real_))
+  }
+
+  logdet_Pn <- as.numeric(determinant(Pn, logarithm = TRUE)$modulus)
+
+  ## pi(y0 | y) ∝ |XtX + S0_inv|^{-1/2} * [b_(y0)]^{-(T+a0)/2} * I[c0,d0](y0)
+  log_post <- -0.5 * logdet_Pn - 0.5 * (length(y) + a0) * log(b_y0)
+
+  list(log_post = log_post, Pn = Pn, mn = mn, b_y0 = b_y0)
+}
+
+## --------------------------------------------------------------
+## 3) Fit one single-series baseline by direct posterior sampling
+## --------------------------------------------------------------
+fit_single_series_baseline <- function(y_train,
+                                       n_draws = 1000,
+                                       grid_len = 100,
+                                       Sigma0 = diag(c(1e4, 1e4), 2),
+                                       a0 = 2,
+                                       b0 = 2) {
+
+  y_train <- as.numeric(y_train)
+  n <- length(y_train)
+
+  ## Prior mean for beta = OLS estimate from regressing Y on lag(Y)
+  beta_prior_mean <- ols_beta_from_lags(y_train)
+
+  ## Uniform prior support for y0
+  c0 <- 0.75 * min(y_train)
+  d0 <- 1.25 * max(y_train)
+
+  if (!is.finite(c0) || !is.finite(d0) || c0 >= d0) {
+    stop("Invalid support for y0: need c0 < d0.")
+  }
+
+  y0_grid <- seq(c0, d0, length.out = grid_len)
+
+  comp_list <- lapply(y0_grid, function(g) {
+    posterior_components_y0(
+      y_train = y_train,
+      y0 = g,
+      beta_prior_mean = beta_prior_mean,
+      Sigma0 = Sigma0,
+      a0 = a0,
+      b0 = b0
+    )
+  })
+
+  log_post <- vapply(comp_list, function(z) z$log_post, numeric(1))
+  w <- exp(log_post - max(log_post))
+  w[!is.finite(w)] <- 0
+  if (sum(w) <= 0) stop("All marginal posterior weights for y0 are zero or non-finite.")
+  w <- w / sum(w)
+
+  idx_draws <- sample(seq_along(y0_grid), size = n_draws, replace = TRUE, prob = w)
+
+  y0_draws     <- numeric(n_draws)
+  beta_draws   <- matrix(NA_real_, nrow = n_draws, ncol = 2)
+  sigma2_draws <- numeric(n_draws)
+
+  for (s in seq_len(n_draws)) {
+    idx  <- idx_draws[s]
+    y0s  <- y0_grid[idx]
+    comp <- comp_list[[idx]]
+
+    ## sigma2 | y0, y ~ IG((T+a0)/2, b_(y0)/2)
+    sigma2_s <- rinvgamma1(
+      shape = (n + a0) / 2,
+      scale = comp$b_y0 / 2
+    )
+
+    ## beta | y0, y, sigma2 ~ N(mn, sigma2 * (XtX + S0_inv)^(-1))
+    Pn_inv <- solve(comp$Pn)
+    beta_s <- rmvnorm_chol(
+      mu = as.numeric(comp$mn),
+      Sigma = sigma2_s * Pn_inv
+    )
+
+    y0_draws[s]     <- y0s
+    sigma2_draws[s] <- sigma2_s
+    beta_draws[s, ] <- beta_s
+  }
+
+  colnames(beta_draws) <- c("beta0", "beta1")
+
+  list(
+    y0_draws = y0_draws,
+    beta_draws = beta_draws,
+    sigma2_draws = sigma2_draws,
+    y0_grid = y0_grid,
+    y0_weights = w,
+    hyper = list(
+      beta_prior_mean = beta_prior_mean,
+      Sigma0 = Sigma0,
+      a0 = a0,
+      b0 = b0,
+      c0 = c0,
+      d0 = d0
+    )
+  )
+}
+
+## --------------------------------------------------------------
+## 4) Fit all series independently
+## --------------------------------------------------------------
+fit_single_baseline_panel <- function(Y_train,
+                                      n_draws = 1000,
+                                      grid_len = 100,
+                                      Sigma0 = diag(c(1e4, 1e4), 2),
+                                      a0 = 2,
+                                      b0 = 2) {
+
+  Y_train <- as.matrix(Y_train)
+  L <- ncol(Y_train)
+
+  if (length(b0) == 1) b0 <- rep(b0, L)
+
+  fits <- vector("list", L)
+
+  for (j in seq_len(L)) {
+    fits[[j]] <- fit_single_series_baseline(
+      y_train = Y_train[, j],
+      n_draws = n_draws,
+      grid_len = grid_len,
+      Sigma0 = Sigma0,
+      a0 = a0,
+      b0 = b0[j]
+    )
+  }
+
+  beta0_draws  <- sapply(fits, function(z) z$beta_draws[, 1])
+  beta1_draws  <- sapply(fits, function(z) z$beta_draws[, 2])
+  sigma2_draws <- sapply(fits, function(z) z$sigma2_draws)
+  y0_draws     <- sapply(fits, function(z) z$y0_draws)
+
+  if (is.null(dim(beta0_draws))) {
+    beta0_draws  <- matrix(beta0_draws, ncol = 1)
+    beta1_draws  <- matrix(beta1_draws, ncol = 1)
+    sigma2_draws <- matrix(sigma2_draws, ncol = 1)
+    y0_draws     <- matrix(y0_draws, ncol = 1)
+  }
+
+  colnames(beta0_draws)  <- colnames(Y_train)
+  colnames(beta1_draws)  <- colnames(Y_train)
+  colnames(sigma2_draws) <- colnames(Y_train)
+  colnames(y0_draws)     <- colnames(Y_train)
+
+  list(
+    fits = fits,
+    beta0_draws = beta0_draws,
+    beta1_draws = beta1_draws,
+    sigma2_draws = sigma2_draws,
+    y0_draws = y0_draws,
+    Y_train = Y_train,
+    Y_test = Y_test
+  )
+}
+
+## --------------------------------------------------------------
+## 5) Parameter summaries
+## --------------------------------------------------------------
+summarize_single_baseline_parameters <- function(fit_obj, prob = 0.95) {
+
+  make_tbl <- function(draw_mat, prefix) {
+    hpdi <- t(apply(draw_mat, 2, function(x) {
+      HPDinterval(as.mcmc(x), prob = prob)[1, ]
+    }))
+
+    data.frame(
+      MSA = if (is.null(colnames(draw_mat))) paste0("MSA_", seq_len(ncol(draw_mat))) else colnames(draw_mat),
+      Mean = colMeans(draw_mat),
+      SD = apply(draw_mat, 2, sd),
+      HPDI = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+      Parameter = prefix,
+      row.names = NULL
+    )
+  }
+
+  bind_rows(
+    make_tbl(fit_obj$y0_draws, "y0"),
+    make_tbl(fit_obj$beta0_draws, "beta0"),
+    make_tbl(fit_obj$beta1_draws, "beta1"),
+    make_tbl(fit_obj$sigma2_draws, "sigma2")
+  ) %>%
+    select(Parameter, everything())
+}
+
+## --------------------------------------------------------------
+## 6) Prediction of the left-out transformed value
+## --------------------------------------------------------------
+predict_leftout_diff2_single_baseline <- function(fit_obj, last_train_diff2_row) {
+  n_draws <- nrow(fit_obj$beta0_draws)
+  L       <- ncol(fit_obj$beta0_draws)
+
+  preds <- matrix(NA_real_, nrow = n_draws, ncol = L)
+
+  for (j in seq_len(L)) {
+    ## Conditional mean for the left-out transformed value
+    mu_j <- fit_obj$beta0_draws[, j] +
+            fit_obj$beta1_draws[, j] * last_train_diff2_row[j]
+
+    ## Posterior predictive draw:
+    ## Delta^2 sqrt(y_T) = beta0 + beta1 * Delta^2 sqrt(y_{T-1}) + error
+    preds[, j] <- rnorm(
+      n = n_draws,
+      mean = mu_j,
+      sd = sqrt(fit_obj$sigma2_draws[, j])
+    )
+  }
+
+  colnames(preds) <- colnames(fit_obj$beta0_draws)
+  preds
+}
+
+## --------------------------------------------------------------
+## 7) Back-transform to level and compute prediction metrics
+## --------------------------------------------------------------
+predict_leftout_level_2diff_single_baseline <- function(fit_obj,
+                                                        MSA_data,
+                                                        mdata,
+                                                        msa_data,
+                                                        msa_data_level,
+                                                        prob = 0.95) {
+
+  T_full <- nrow(MSA_data)
+  L      <- ncol(MSA_data)
+
+  diff2_lag  <- as.numeric(MSA_data[T_full - 1, ])
+  diff2_true <- as.numeric(MSA_data[T_full, ])
+
+  diff1_prev <- as.numeric(mdata[nrow(mdata) - 1, ])
+  sqrt_prev  <- as.numeric(msa_data[nrow(msa_data) - 1, ])
+  true_level <- as.numeric(msa_data_level[nrow(msa_data_level), ])
+
+  ## transformed-scale prediction happens here
+  diff2_preds <- predict_leftout_diff2_single_baseline(fit_obj, diff2_lag)
+
+  ## back-transform to level
+  diff1_preds <- sweep(diff2_preds, 2, diff1_prev, "+")
+  sqrt_preds  <- sweep(diff1_preds, 2, sqrt_prev, "+")
+  level_preds <- sqrt_preds^2
+
+  msa_names <- colnames(msa_data_level)
+  if (is.null(msa_names)) msa_names <- paste0("MSA_", seq_len(L))
+  colnames(level_preds) <- msa_names
+
+  PM    <- colMeans(level_preds)
+  PSD   <- apply(level_preds, 2, sd)
+  Bias  <- PM - true_level
+  PARB  <- abs(Bias / true_level)
+  PRMSE <- sqrt(Bias^2 + PSD^2)
+
+  hpdi <- t(apply(level_preds, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  pred_table <- data.frame(
+    MSA = msa_names,
+    True = true_level,
+    PM = PM,
+    PSD = PSD,
+    Bias = Bias,
+    PARB = PARB,
+    PRMSE = PRMSE,
+    HPDI = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names = NULL
+  )
+
+  list(
+    diff2_true = diff2_true,
+    level_preds = level_preds,
+    true_level = true_level,
+    pred_table = pred_table
+  )
+}
+
+## --------------------------------------------------------------
+## 8) Relative-error summary
+## --------------------------------------------------------------
+error_summary_single_baseline <- function(level_preds, true_level, prob = 0.95) {
+
+  n_draws <- nrow(level_preds)
+
+  rel_err <- sweep(level_preds, 2, true_level, "-")
+  rel_err <- sweep(rel_err, 2, true_level, "/")
+
+  Mean_R    <- colMeans(rel_err)
+  SD_R      <- apply(rel_err, 2, sd)
+  MCSE_mean <- SD_R / sqrt(n_draws)
+  CV_R      <- ifelse(abs(Mean_R) < .Machine$double.eps, NA_real_, SD_R / abs(Mean_R))
+
+  hpdi <- t(apply(rel_err, 2, function(x) {
+    HPDinterval(as.mcmc(x), prob = prob)[1, ]
+  }))
+
+  msa_names <- colnames(level_preds)
+  if (is.null(msa_names)) msa_names <- paste0("MSA_", seq_len(ncol(level_preds)))
+
+  data.frame(
+    MSA = msa_names,
+    Mean = Mean_R,
+    SD = SD_R,
+    MCSE_mean = MCSE_mean,
+    CV = CV_R,
+    HPDI = sprintf("(%.4f, %.4f)", hpdi[, 1], hpdi[, 2]),
+    row.names = NULL
+  )
+}
+
+## --------------------------------------------------------------
+## 9) Run everything
+## --------------------------------------------------------------
+single_fit <- fit_single_baseline_panel(
+  Y_train = Y_train,
+  n_draws = 1000,
+  grid_len = 100,
+  Sigma0 = diag(c(1e4, 1e4), 2),
+  a0 = 2,
+  b0 = 2
+)
+
+param_table_single <- summarize_single_baseline_parameters(single_fit)
+
+pred_out_single <- predict_leftout_level_2diff_single_baseline(
+  fit_obj = single_fit,
+  MSA_data = MSA_data,
+  mdata = mdata,
+  msa_data = msa_data,
+  msa_data_level = msa_data_level
+)
+
+pred_table_single <- pred_out_single$pred_table
+err_table_single  <- error_summary_single_baseline(
+  pred_out_single$level_preds,
+  pred_out_single$true_level
+)
+
+## --------------------------------------------------------------
+## 10) View results
+## --------------------------------------------------------------
+cat("\n--- Posterior Parameter Summaries: SS model ---\n")
+print(param_table_single, row.names = FALSE, digits = 4)
+
+cat("\n--- Posterior Prediction Metrics: SS model ---\n")
+print(pred_table_single, row.names = FALSE, digits = 4)
+
+cat("\n--- Relative-Error Metrics: SS model ---\n")
+print(err_table_single, row.names = FALSE, digits = 4)
+```
+
