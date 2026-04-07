@@ -53,7 +53,13 @@ This model is appropriate when:
 
 ## MTS Baseline
 
-The MTS Baseline provides a benchmark without the full spatial CAR structure. It is included for model comparison.
+The MTS Baseline provides a benchmark without the full spatial CAR structure:
+
+$$
+y_{it} \mid \mu_i,b_i,\sigma^2, y_{i,t-1} \sim \mathcal{N}\!\left(\mu_i + b_i y_{i,t-1},\, \sigma^2 \right), \qquad t=1,\dots,T,\quad i=1,\dots,\ell.
+$$
+
+It is included for model comparison.
 
 ## SS Baseline
 
